@@ -1,0 +1,177 @@
+---
+title: "Airbnb in London - Initial data exploration and simple price analysis"
+author: "Webster"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: true
+    theme: default
+---
+
+First, we load the useful packages. 
+```{r setup, include=FALSE}
+library(tidyverse)
+library(ggmap) 
+library(lfe) #Transforms away factors with many levels prior to doing an OLS. Useful for estimating linear models with multiple group fixed effects, and for estimating linear models which uses factors with many levels as pure control variables. Includes support for instrumental variables, conditional F statistics for weak instruments, robust and multi-way clustered standard errors, as well as limited mobility bias correction.
+library(here)
+```
+
+# Downloading the data 
+
+We go and download the data where it is, on the InsideAirbnb website. We choose to download the data from July 2019 for London (pre-pandemic). 
+```{r}
+# ## Requires internet connection
+# download.file(
+#   "http://data.insideairbnb.com/united-kingdom/england/london/2019-07-10/data/listings.csv.gz",
+#   here("01. Raw"","listings.csv.gz")) 
+# 
+# download.file(
+#   "http://data.insideairbnb.com/united-kingdom/england/london/2019-07-10/data/calendar.csv.gz",
+#   here("01. Raw","calendar.csv.gz")) 
+# 
+# download.file(
+#   "http://data.insideairbnb.com/united-kingdom/england/london/2019-07-10/data/reviews.csv.gz",
+#   here("01. Raw","reviews.csv.gz"))  
+# 
+# download.file(
+#   "http://data.insideairbnb.com/united-kingdom/england/london/2019-07-10/visualisations/neighbourhoods.geojson",
+#   here("01. Raw","neighbourhoods.geojson"))
+```
+
+Now that we have downloaded the data, we open the different files and store them into R objects. Note that we do not need to unzip the files, it is done on the fly. 
+```{r, include=FALSE}
+listdb <- read_csv(here("01. Raw","listings.csv.gz"))
+caldb <- read_csv(here("01. Raw","calendar.csv.gz"))
+revdb <- read_csv(here("01. Raw", "reviews.csv.gz"))
+neighdb <- geojsonsf::geojson_sf(here("01. Raw", "neighbourhoods.geojson"))
+```
+
+Let's see what these datasets look like. 
+- Listings: shows characteristics and price posted by 83,850 listings in July 2019 in London. Of particular interest is precise location, descriptions, and number of reviews
+- Calendar: shows for each date in the calendar and each listing (30 million observations) if the day is available, how much it costs, and the number of bookable nights
+- Reviews: 1.4 million reviews available for these listings. 
+- Neighbourhoods: this is a geographic dataset with the contours of London boroughs.
+```{r}
+listdb %>% head
+caldb %>% head
+revdb %>% head
+neighdb %>% head
+```
+
+# Mapping the data
+
+Let's map the neighbourhoods. Yes, it looks like London, indeed. 
+```{r}
+neighdb %>% ggplot() + geom_sf() +
+  theme_bw()
+```
+
+Let's now put the listings on top of the previous map. We adjust the transparancy to make a "heatmap" - this allows us to have a better idea of the areas where listings are mostly located. The map confirms that listings are in central London, not much in the periphery of London. 
+```{r}
+#converting the longitude and latitude in lisdb to sf format to feed into ggplot
+listsf <- listdb %>% sf::st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+
+ggplot(listsf) + 
+  geom_sf(data = neighdb) + 
+  geom_sf(alpha=.01, inherit.aes =FALSE, color = "red")+
+  theme_bw()
+
+```
+
+Let's now zoom in on Central London. This map is clearer indeed. One can guess parks and areas more sparsely populated. 
+```{r}
+ggplot(listsf) + 
+  geom_sf(data = neighdb) + 
+  geom_sf(alpha=.05, inherit.aes =FALSE) + 
+  coord_sf(xlim=c(-.2,0),ylim=c(51.47,51.57)) +
+  theme_bw()
+
+```
+
+
+# Amenities
+
+An interesting pattern in the data is that we know all the amenities that hosts are listing about their properties. There are hundreds of them and they might be important to understand how hosts price their properties. 
+
+We first unpack the list of amenities and keep the ones that appear enough times (we take a threshold of 200). 
+```{r}
+listdb <- listdb %>% 
+  mutate(amen = amenities %>% 
+           str_replace_all("[-/ ]","_") %>%         #match either - or / or space and replace with _
+           str_remove_all("[()’]") %>%              #remove all ( or ) or '
+           str_replace_all("24_hour","H24") %>%     # replace 24_hour with H24
+           str_to_lower())                          #lowercase
+
+amen_unpacked <- listdb %>% pull(amen) %>% 
+  str_remove_all("[{}]") %>% str_remove_all('\\"') %>% str_split(",")  
+
+#Remove automated messages
+list_amen <- tibble(amen = do.call("c", amen_unpacked)) %>% count(amen) %>% filter(n>200) %>% pull(amen) %>% setdiff(c("","_toilet","translation_missing:_en.hosting_amenity_49","translation_missing:_en.hosting_amenity_50")) 
+
+```
+
+The object `list_amen` that we have created contains 116 amenities that are frequently used. Now, we create a dataset with the same number of observations as the number of listings, with dummy variables for each amenity. 
+```{r}
+amen_dummy_fun <- function(amenity) {
+  amen_unpacked %>% 
+    map_lgl(function(vv){any(amenity==vv)})
+  }
+
+listdb2 <- list_amen %>% map(amen_dummy_fun)
+names(listdb2) <- list_amen
+listdb2 <- listdb2 %>% as_tibble() 
+listdb2 %>% head
+```
+
+Now let's turn to the property_type variable, it has way too many values, we'll need to simplify it a bit. We do that below. 
+```{r}
+listdb %>% count(property_type) %>% arrange(desc(n))
+```
+
+What about the neighbourhood and neighbourhood_cleansed variables. What do they look like? 
+```{r}
+listdb %>% count(neighbourhood) %>% arrange(desc(n))
+listdb %>% count(neighbourhood_cleansed) %>% arrange(desc(n))
+```
+# Modelling prices using simple linear regressions
+
+Based on the ground work above, we build the regression dataset, where we clean a few variables, add the dummy variables for amenities, and remove one zero-price observation. 
+```{r}
+regdb <- listdb %>% 
+  mutate(price = price %>% str_sub(2,-1) %>% str_remove_all(",") %>% as.numeric(), 
+         log_price = log(price), 
+         square_feet_na = is.na(square_feet), 
+         square_feet = ifelse(is.na(square_feet),0,square_feet), 
+         property_type = ifelse(property_type %in% c("Apartment","House","Townhouse","Serviced apartment"),property_type,"Other")) %>% 
+  select(id, log_price, square_feet, square_feet_na, property_type, room_type, 
+         accommodates, bathrooms, bedrooms, beds, bed_type,neighbourhood) %>% 
+  bind_cols(listdb2) %>%
+  filter(is.finite(log_price)) 
+```
+
+Now, we run the regressions. We run three specifications: 
+- A simple one with just a few variables, 
+- A more involved one with amenities, 
+- The biggest one with amenities and neighbourhood fixed effects. 
+```{r}
+price_formula <- formula("log_price ~ property_type + room_type + accommodates + bathrooms + bedrooms + beds + bed_type + square_feet + square_feet_na")
+
+price_formula_big <- paste0("log_price ~ property_type + room_type + accommodates + bathrooms + bedrooms + beds + bed_type + square_feet + square_feet_na +", 
+                        paste(list_amen, collapse= " + ")) %>% formula()
+
+price_formula_big_neigh <- paste0("log_price ~ property_type + room_type + accommodates + bathrooms + bedrooms + beds + bed_type + square_feet + square_feet_na +", 
+                        paste(list_amen, collapse= " + "), "| neighbourhood") %>% formula()
+
+res <- felm(price_formula, regdb)
+res %>% summary
+resb <- felm(price_formula_big, regdb)
+resb %>% summary
+resbf <- felm(price_formula_big_neigh, regdb)
+resbf %>% summary
+```
+
+Interestingly, this leaves us with several specifications. The biggest one explains a larger part of the variance ($R^2$ is high), but that comes at the high cost regarding the lack of parsimony. Model selection method would be useful to help sort out which is the "best" one (and for what). A natural extension is to use $\ell_2$ models (e.g. Lasso) to aid with model selection.
