@@ -56,10 +56,10 @@ Let's see what these datasets look like.
 - Reviews: 1.4 million reviews available for these listings. 
 - Neighbourhoods: this is a geographic dataset with the contours of London boroughs.
 ```{r}
-listdb %>% head
-caldb %>% head
-revdb %>% head
-neighdb %>% head
+listdb %>% head()
+caldb %>% head()
+revdb %>% head()
+# neighdb %>% glimpse()
 ```
 
 # Mapping the data
